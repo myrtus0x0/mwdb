@@ -3,9 +3,12 @@ package mwdb
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"mime/multipart"
 	"net/http"
 	"time"
 )
@@ -21,6 +24,87 @@ const (
 	fileInfoBase   = "/api/file"
 	configInfoBase = "/api/config"
 )
+
+func (m *MwdbClient) makeAuthenticatedFileUpload(ctx context.Context, contents []byte, URIPath string, parent string, uploadAs string) (string, error) {
+	httpCli := http.Client{
+		Timeout: 15 * time.Second,
+	}
+
+	urlStr := m.protocol + m.host + URIPath
+
+	pseudoFilename := fmt.Sprintf("%x.bin", md5.Sum(contents))
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	fw, err := writer.CreateFormFile("file", pseudoFilename)
+	if err != nil {
+		return "", err
+	}
+
+	_, err = io.Copy(fw, bytes.NewBuffer(contents))
+	if err != nil {
+		return "", err
+	}
+
+	if parent != "" {
+		optionsw, err := writer.CreateFormField("options")
+		if err != nil {
+			return "", err
+		}
+		temp := &uploadFileMetadata{}
+		temp.Metakeys = []metakey{}
+		temp.Parent = parent
+		temp.UploadAs = uploadAs
+
+		marshalledJson, err := json.Marshal(temp)
+		if err != nil {
+			return "", err
+		}
+
+		_, err = io.Copy(optionsw, bytes.NewBuffer(marshalledJson))
+		if err != nil {
+			return "", err
+		}
+	}
+
+
+	err = writer.Close()
+	if err != nil {
+		return "", err
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, urlStr, body)
+	if err != nil {
+		return "", err
+	}
+
+	request.Header.Add("Content-Type", writer.FormDataContentType())
+	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", m.apiKey))
+
+	response, err := httpCli.Do(request)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		return "", err
+	}
+
+	unmarshalledJSON := &uploadFileResponse{}
+
+	err = json.Unmarshal(resp, unmarshalledJSON)
+	if err != nil {
+		return "", err
+	}
+
+
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("invalid response code: %d", response.StatusCode)
+	}
+
+	return unmarshalledJSON.Sha256, nil
+}
 
 func (m *MwdbClient) makeAuthenticatedHTTPRequest(ctx context.Context, body []byte, method string, URIPath string, headers map[string]string) ([]byte, error) {
 	urlStr := m.protocol + m.host + URIPath
@@ -86,11 +170,29 @@ func (m *MwdbClient) UploadConfigForSample(ctx context.Context, hash string, con
 	return err
 }
 
-// UploadSample uploads a sample to MWDB with the given tags
-func (m *MwdbClient) UploadSample(ctx context.Context, fileContents []byte, tags map[string]string) error {
-	uriPath := fileInfoBase
-	_, err := m.makeAuthenticatedHTTPRequest(ctx, fileContents, http.MethodPost, uriPath, nil)
+func (m *MwdbClient) AddTag(ctx context.Context, sha256 string, tag string) error {
+	uriPath := fmt.Sprintf("/api/%s/%s/tag", "file", sha256)
+	tagBody := fmt.Sprintf(`{"tag":"%s"}`, tag)
+	_, err := m.makeAuthenticatedHTTPRequest(ctx, []byte(tagBody), http.MethodPut, uriPath, nil)
 	return err
+}
+
+// UploadSample uploads a sample to MWDB with the given tags
+func (m *MwdbClient) UploadSample(ctx context.Context, fileContents []byte, tags map[string]string, parent string, uploadAs string) error {
+	uriPath := fileInfoBase
+	sha256, err := m.makeAuthenticatedFileUpload(ctx, fileContents, uriPath, parent, uploadAs)
+	if err != nil {
+		return err
+	}
+
+	for tagK, tagV := range tags {
+		tag := tagK + ":" + tagV
+		err := m.AddTag(ctx, sha256, tag)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // GetInfoAboutSample returns all information about the sample held within MWDB
